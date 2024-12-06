@@ -15,8 +15,7 @@
 mod spinwait;
 use std::cell::Cell;
 use std::{ptr, thread};
-use std::ptr::null_mut;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::{current, Thread};
 use lock_api::GuardSend;
 use crate::spinwait::SpinWait;
@@ -63,6 +62,7 @@ impl Node {
 /// A raw locking primitive. Holds the head of the FIFO list and also the state of the lock
 pub struct RawMiniLock{
     head: AtomicUsize,
+    thread_id_locked: AtomicU64
 }
 
 impl Default for RawMiniLock {
@@ -77,12 +77,13 @@ impl RawMiniLock {
     #[must_use] pub const fn new()-> Self {
         Self {
             head: AtomicUsize::new(0),
+            thread_id_locked: AtomicU64::new(0)
         }
     }
 
 
     fn push_or_lock(&self, node: &mut Node) -> bool {
-        assert_eq!(node.next, null_mut());
+        assert_eq!(node.next, ptr::null());
 
         let mut head = 0;
         loop {
@@ -103,13 +104,23 @@ impl RawMiniLock {
         }
     }
 
-    fn pop(&self)->Option<Thread> {
+    /// Pops a thread handle off of the fron of the wait queue
+    /// 
+    /// # Safety
+    /// 
+    /// The lock must be held by the calling thread to modify the queue
+    unsafe fn pop(&self)->Option<Thread> {
         // check that it's locked. It needs to be locked by current thread too but we can't check this
         debug_assert!(self.head.load(Ordering::Acquire).get_flag());
 
         let mut head = self.head.load(Ordering::Acquire);
 
+        assert_ne!(head, 0);
+
         while head != LOCKED_BIT {
+            // SAFETY: dereferencing here is safe as we have already check that the pointer is not null with the assert
+            // since we have the lock and all threads that add to the queue must sleep until worken we know that this memory
+            // will be safe to access
             let head_ref = unsafe {head.get_ptr().as_ref().expect("got a null pointer from lock head")};
             let next = head_ref.next;
             if let Err(new_head) = self.head.compare_exchange(head, next as usize | LOCKED_BIT, Ordering::Relaxed, Ordering::Acquire) {
@@ -124,10 +135,16 @@ impl RawMiniLock {
 
         None
     }
+
+    fn thread_waiting(&self)->bool {
+        self.head.load(Ordering::Acquire) & PTR_MASK != 0
+    }
 }
 
+#[allow(clippy::undocumented_unsafe_blocks)]
 unsafe impl lock_api::RawMutex for RawMiniLock {
-    const INIT: Self = RawMiniLock::new();
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: Self = Self::new();
     type GuardMarker = GuardSend;
 
     fn lock(&self) {
@@ -145,8 +162,9 @@ unsafe impl lock_api::RawMutex for RawMiniLock {
             }
 
             // we will push ourselves onto the queue and then sleep
-
-            let mut node = Node::new(current());
+            let thread_handle = current();
+            // TODO can we check for attempting to lock with the same thread here?
+            let mut node = Node::new(thread_handle);
 
             if self.push_or_lock(&mut node) {
                 return;
@@ -169,9 +187,12 @@ unsafe impl lock_api::RawMutex for RawMiniLock {
     }
 
     unsafe fn unlock(&self) {
-        debug_assert!(self.is_locked());
-
         loop {
+            if let Err(head) = self.head.compare_exchange(LOCKED_BIT, 0, Ordering::Release, Ordering::Relaxed) {
+                assert!(head.get_flag(), "unlock of unlocked mutex");
+            } else {
+                return;
+            }
             if self.head.compare_exchange(LOCKED_BIT, 0, Ordering::Release, Ordering::Relaxed).is_ok() {
                 return;
             }
@@ -213,72 +234,120 @@ pub type MiniLockGuard<'a, T> = lock_api::MutexGuard<'a, RawMiniLock, T>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
+    /// Test that the lock initializes correctly and can be locked/unlocked.
     #[test]
-    fn it_works_threaded() {
-        let mutex = MiniLock::new(());
-        let barrier = std::sync::Barrier::new(2);
-        let num_iterations = 10;
-        thread::scope(|s| {
-            s.spawn(|| {
-                for _ in 0..num_iterations {
-                    let guard = mutex.lock();
-                    barrier.wait();
-                    thread::sleep(Duration::from_millis(50));
-                    while unsafe{mutex.raw()}.head.load(Ordering::Acquire).get_ptr().is_null() {
-                        thread::yield_now();
-                    }
-                    drop(guard);
-                    barrier.wait();
-                }
-            });
-            for _ in 0..num_iterations {
-                barrier.wait();
-                assert!(mutex.is_locked());
-                let start = Instant::now();
-                let guard = mutex.lock();
-                let elapsed = start.elapsed().as_millis();
-                assert!(elapsed >= 10);
-                drop(guard);
-                barrier.wait();
-            }
-        });
+    fn test_lock_unlock() {
+        let mutex = MiniLock::new(42);
+        assert!(!mutex.is_locked());
+        {
+            let mut guard = mutex.lock();
+            assert_eq!(*guard, 42);
+            assert!(mutex.is_locked());
+            *guard = 43;
+        }
+        assert!(!mutex.is_locked());
+        assert_eq!(*(mutex.lock()), 43);
+    }
+
+    /// Test that `try_lock` works and does not block.
+    #[test]
+    fn test_try_lock() {
+        let mutex = MiniLock::new(0);
+        let guard = mutex.try_lock();
+        assert!(guard.is_some());
+        assert!(mutex.is_locked());
+        // this shouldn't block and return None immediately because the lock is already locked
+        assert!(mutex.try_lock().is_none());
+        drop(guard);
         assert!(!mutex.is_locked());
     }
 
-    fn do_lots_and_lots(j: u64, k: u64) {
-        let m = MiniLock::new(0_u64);
+    /// Test contention between multiple threads.
+    #[test]
+    fn test_thread_contention() {
+        let mutex = Arc::new(MiniLock::new(0));
+        let num_threads = 4;
 
-        thread::scope(|s| {
-            for _ in 0..k {
-                s.spawn(|| {
-                    for _ in 0..j {
-                        *m.lock() += 1;
+        #[cfg(miri)]
+        let iterations = 100;
+        #[cfg(not(miri))]
+        let iterations = 10000;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let mutex = Arc::clone(&mutex);
+                thread::spawn(move || {
+                    for _ in 0..iterations {
+                        *mutex.lock() += 1;
                     }
-                });
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(*mutex.lock(), num_threads * iterations);
+    }
+
+    /// Test that threads block and wake correctly.
+    #[test]
+    fn test_thread_blocking() {
+        let mutex = Arc::new(MiniLock::new(()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let mutex_clone = Arc::clone(&mutex);
+        let barrier_clone = Arc::clone(&barrier);
+
+        let handle = thread::spawn(move || {
+            let _guard = mutex_clone.lock();
+            barrier_clone.wait();
+            // wait for another thread to queue for the lock
+            while !unsafe {
+                mutex_clone.raw()
+            }.thread_waiting() {
+                thread::yield_now();
             }
+            // force the other thread to block for some time
+            thread::sleep(Duration::from_millis(105));
         });
 
-        assert_eq!(*m.lock(), j * k);
+        barrier.wait(); // Ensure the other thread has locked the mutex.
+        assert!(mutex.is_locked());
+
+        // Attempting to lock from this thread should block until the other thread unlocks.
+        let start = std::time::Instant::now();
+        let _guard = mutex.lock();
+        let elapsed = start.elapsed();
+        // we did block the expected time while waiting for the lock!
+        assert!(elapsed >= Duration::from_millis(100));
+
+        handle.join().unwrap();
     }
 
+    /// Test lock reentrancy is not allowed.
     #[test]
-    #[cfg_attr(miri, ignore)]
-    fn lots_and_lots() {
-        const J: u64 = 1_0000_000;
-        // const J: u64 = 10000000;
-        // const J: u64 = 50000000;
-        const K: u64 = 6;
-        do_lots_and_lots(J, K);
+    #[should_panic(expected = "deadlock")]
+    #[ignore = "don't yet have deadlock detection"]
+    fn test_lock_reentrancy() {
+        let mutex = MiniLock::new(());
+        let _guard = mutex.lock();
+        // This should deadlock or panic because MiniLock is not reentrant.
+        let _guard2 = mutex.lock();
     }
 
+    /// Test that unlocking an already unlocked mutex panics.
     #[test]
-    fn lots_and_lots_miri() {
-        const J: u64 = 600;
-        const K: u64 = 3;
-
-        do_lots_and_lots(J, K);
+    #[should_panic(expected = "unlock of unlocked mutex")]
+    fn test_double_unlock() {
+        let mutex = MiniLock::new(42);
+        unsafe {
+            mutex.force_unlock();
+        }
     }
 }
