@@ -1,0 +1,8 @@
+[package]
+name = "mini_lock"
+version = "1.0.0"
+edition = "2021"
+description="A light weight, unfair, FILO, priority inversion safe Mutex"
+
+[dependencies]
+lock_api = "0.4.12"
